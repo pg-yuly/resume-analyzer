@@ -1,12 +1,21 @@
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.output_parsers import PydanticOutputParser
-from langchain.schema import BaseOutputParser
+from langchain_community.chat_models import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.output_parsers.base import BaseOutputParser
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 import json
 import logging
 from app.core.config import settings
+
+# 如果指定了智谱AI，导入相关包
+try:
+    import zhipuai
+    from langchain_community.llms import Zhipu
+    ZHIPUAI_AVAILABLE = True
+except ImportError:
+    ZHIPUAI_AVAILABLE = False
+    logging.warning("智谱AI包未安装，无法使用智谱AI模型")
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +37,8 @@ class PydanticParser(BaseOutputParser):
     """输出解析器，将LLM输出解析为ResumeAnalysisResult对象"""
     
     def __init__(self):
-        self.pydantic_parser = PydanticOutputParser(pydantic_object=ResumeAnalysisResult)
+        super().__init__()
+        self._pydantic_parser = PydanticOutputParser(pydantic_object=ResumeAnalysisResult)
     
     def parse(self, text: str) -> ResumeAnalysisResult:
         try:
@@ -36,12 +46,18 @@ class PydanticParser(BaseOutputParser):
             if text.startswith("{") and text.endswith("}"):
                 try:
                     json_obj = json.loads(text)
-                    return ResumeAnalysisResult.parse_obj(json_obj)
+                    # 根据Pydantic版本使用不同的方法
+                    try:
+                        # Pydantic V2
+                        return ResumeAnalysisResult.model_validate(json_obj)
+                    except AttributeError:
+                        # Pydantic V1
+                        return ResumeAnalysisResult.parse_obj(json_obj)
                 except json.JSONDecodeError:
                     pass
             
             # 回退到Pydantic解析器
-            return self.pydantic_parser.parse(text)
+            return self._pydantic_parser.parse(text)
         except Exception as e:
             logger.error(f"解析LLM输出失败: {e}")
             logger.error(f"原始文本: {text}")
@@ -49,7 +65,7 @@ class PydanticParser(BaseOutputParser):
             return ResumeAnalysisResult(
                 matches_requirements=False,
                 match_score=0.0,
-                reasoning="解析AI输出时出错",
+                reasoning=f"解析AI输出时出错: {str(e)}",
                 skills_match={},
                 experience_match=False,
                 education_match=False,
@@ -61,25 +77,37 @@ class PydanticParser(BaseOutputParser):
 class ResumeAnalyzer:
     """简历分析器，使用AI评估简历是否符合要求"""
     
-    def __init__(self, api_key: str, model_name: str = "gpt-4"):
+    def __init__(self, api_key: str = None, model_name: str = None, provider: str = None):
         """
         初始化简历分析器
         
         Args:
-            api_key: OpenAI API密钥
+            api_key: API密钥
             model_name: 使用的模型名称
+            provider: AI提供商，支持 'openai' 和 'zhipuai'
         """
-        self.api_key = api_key
-        self.model_name = model_name
+        self.api_key = api_key or (settings.OPENAI_API_KEY if settings.AI_PROVIDER == "openai" else settings.ZHIPUAI_API_KEY)
+        self.model_name = model_name or (settings.OPENAI_MODEL if settings.AI_PROVIDER == "openai" else settings.ZHIPUAI_MODEL)
+        self.provider = provider or settings.AI_PROVIDER
         self.output_parser = PydanticParser()
         
         # 初始化LLM
-        self.llm = ChatOpenAI(
-            model_name=model_name,
-            openai_api_key=api_key,
-            temperature=0.2,
-            max_tokens=3000
-        )
+        if self.provider == "openai":
+            self.llm = ChatOpenAI(
+                model_name=self.model_name,
+                openai_api_key=self.api_key,
+                temperature=0.2,
+                max_tokens=3000
+            )
+        elif self.provider == "zhipuai" and ZHIPUAI_AVAILABLE:
+            self.llm = Zhipu(
+                model_name=self.model_name,
+                temperature=0.2,
+                zhipuai_api_key=self.api_key,
+                max_tokens=3000
+            )
+        else:
+            raise ValueError(f"不支持的AI提供商: {self.provider}")
         
         # 创建提示模板
         self.prompt_template = ChatPromptTemplate.from_messages([
@@ -195,5 +223,29 @@ class ResumeAnalyzer:
             
         return formatted
 
-# 创建默认分析器实例
-default_analyzer = ResumeAnalyzer(api_key=settings.OPENAI_API_KEY, model_name=settings.OPENAI_MODEL) 
+# 创建默认分析器实例，添加异常处理
+try:
+    if settings.AI_PROVIDER == "openai":
+        default_analyzer = ResumeAnalyzer(api_key=settings.OPENAI_API_KEY, model_name=settings.OPENAI_MODEL, provider="openai")
+    elif settings.AI_PROVIDER == "zhipuai" and ZHIPUAI_AVAILABLE:
+        default_analyzer = ResumeAnalyzer(api_key=settings.ZHIPUAI_API_KEY, model_name=settings.ZHIPUAI_MODEL, provider="zhipuai")
+    else:
+        # 回退到OpenAI
+        logger.warning(f"不支持的AI提供商配置 {settings.AI_PROVIDER}，回退到OpenAI")
+        default_analyzer = ResumeAnalyzer(api_key=settings.OPENAI_API_KEY, model_name=settings.OPENAI_MODEL, provider="openai")
+except Exception as e:
+    logger.error(f"初始化分析器失败: {e}")
+    # 创建一个空的分析器，避免应用启动失败
+    from unittest.mock import AsyncMock
+    default_analyzer = AsyncMock()
+    default_analyzer.analyze_resume = AsyncMock(return_value=ResumeAnalysisResult(
+        matches_requirements=False,
+        match_score=0.0,
+        reasoning=f"分析器初始化失败: {str(e)}",
+        skills_match={},
+        experience_match=False,
+        education_match=False,
+        strengths=[],
+        weaknesses=["系统配置错误"],
+        summary="请检查系统配置"
+    )) 
